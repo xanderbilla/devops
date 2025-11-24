@@ -34,3 +34,13 @@ jobs:
           git push origin pre-prod
 
           echo "✅ Auto-merged QA to PRE-PROD branch"
+
+      - name: Trigger PRE-PROD Workflow
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
+            https://api.github.com/repos/xanderbilla/devops/actions/workflows/pre-prod.yml/dispatches \
+            -d '{"ref":"pre-prod"}'
+
+          echo "✅ Triggered PRE-PROD workflow"

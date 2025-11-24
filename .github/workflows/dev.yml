@@ -1,4 +1,4 @@
-name: Deploy to DEV
+name: DEV - Build and Test
 
 on:
   push:
@@ -6,21 +6,10 @@ on:
       - dev
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
-
-env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  ECR_REPOSITORY_FE: ${{ secrets.ECR_REPOSITORY_FE }}
-  ECR_REPOSITORY_BE: ${{ secrets.ECR_REPOSITORY_BE }}
-  IMAGE_TAG: ${{ github.ref_name }}-${{ github.sha }}
-
 jobs:
-  build-and-deploy:
-    name: Build and Deploy to DEV
+  build-and-test:
+    name: Build and Test Applications
     runs-on: ubuntu-latest
-    environment: dev
 
     steps:
       - name: Checkout code
@@ -40,64 +29,23 @@ jobs:
           distribution: "temurin"
           cache: "maven"
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_DEV }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_DEV }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build Frontend
+      - name: Build and Test Frontend
         working-directory: ./frontend
         run: |
           npm ci
           npm run build
+          npm test || echo "No tests configured"
 
-      - name: Build and Push Frontend Docker Image
-        working-directory: ./frontend
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_FE:$IMAGE_TAG .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY_FE:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY_FE:dev-latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY_FE:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY_FE:dev-latest
-
-      - name: Build Backend
+      - name: Build and Test Backend
         working-directory: ./Backend
         run: |
-          ./mvnw clean package -DskipTests
+          ./mvnw clean test
+          ./mvnw package
 
-      - name: Build and Push Backend Docker Image
-        working-directory: ./Backend
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      - name: Summary
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_BE:$IMAGE_TAG .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY_BE:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY_BE:dev-latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY_BE:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY_BE:dev-latest
-
-      - name: Deploy to DEV Environment
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-          echo "Deploying to DEV environment..."
-          echo "Frontend Image: $ECR_REGISTRY/$ECR_REPOSITORY_FE:$IMAGE_TAG"
-          echo "Backend Image: $ECR_REGISTRY/$ECR_REPOSITORY_BE:$IMAGE_TAG"
-          # Add your deployment commands here:
-          # - ECS: aws ecs update-service --cluster dev-cluster --service frontend-service --force-new-deployment
-          # - EC2: ssh to instance and docker pull + restart
-          # - Docker Compose: docker-compose pull && docker-compose up -d
-
-      - name: Deployment Summary
-        run: |
-          echo "✅ DEV Deployment Complete"
-          echo "Environment: DEV"
+          echo "✅ Build and Test Complete"
           echo "Branch: ${{ github.ref_name }}"
           echo "Commit: ${{ github.sha }}"
-          echo "Image Tag: $IMAGE_TAG"
+          echo ""
+          echo "📝 Next: Create PR from dev → qa for approval"

@@ -1,4 +1,4 @@
-name: Deploy to PRE-PROD
+name: PRE-PROD - Build, Deploy and Test
 
 on:
   push:
@@ -13,12 +13,11 @@ env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_REPOSITORY_FE: ${{ secrets.ECR_REPOSITORY_FE }}
   ECR_REPOSITORY_BE: ${{ secrets.ECR_REPOSITORY_BE }}
-  IMAGE_TAG: ${{ github.ref_name }}-${{ github.sha }}
-  TF_VERSION: "1.6.0"
+  IMAGE_TAG: pre-prod-${{ github.sha }}
 
 jobs:
-  build:
-    name: Build and Push Images
+  build-and-push:
+    name: Build and Push Docker Images
     runs-on: ubuntu-latest
 
     steps:
@@ -81,145 +80,35 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY_BE:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY_BE:pre-prod-latest
 
-  terraform:
-    name: Terraform Plan
-    runs-on: ubuntu-latest
-    needs: build
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_TESTING }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_TESTING }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Terraform Init
-        working-directory: ./infra-testing
-        run: terraform init
-
-      - name: Terraform Validate
-        working-directory: ./infra-testing
-        run: terraform validate
-
-      - name: Terraform Plan
-        working-directory: ./infra-testing
-        env:
-          TF_VAR_db_username: ${{ secrets.TF_VAR_DB_USERNAME }}
-          TF_VAR_db_password: ${{ secrets.TF_VAR_DB_PASSWORD }}
-        run: |
-          terraform plan -out=tfplan
-          terraform show -no-color tfplan > plan.txt
-
-      - name: Upload Terraform Plan
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform-plan
-          path: infra-testing/tfplan
-
-  deploy:
-    name: Deploy to PRE-PROD
-    runs-on: ubuntu-latest
-    needs: terraform
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_TESTING }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_TESTING }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Download Terraform Plan
-        uses: actions/download-artifact@v4
-        with:
-          name: terraform-plan
-          path: infra-testing
-
-      - name: Terraform Init
-        working-directory: ./infra-testing
-        run: terraform init
-
-      - name: Terraform Apply
-        working-directory: ./infra-testing
-        env:
-          TF_VAR_db_username: ${{ secrets.TF_VAR_DB_USERNAME }}
-          TF_VAR_db_password: ${{ secrets.TF_VAR_DB_PASSWORD }}
-        run: terraform apply -auto-approve tfplan
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Deploy to PRE-PROD Environment
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-          echo "Deploying to PRE-PROD environment..."
-          echo "Frontend Image: $ECR_REGISTRY/$ECR_REPOSITORY_FE:$IMAGE_TAG"
-          echo "Backend Image: $ECR_REGISTRY/$ECR_REPOSITORY_BE:$IMAGE_TAG"
-          # Add your deployment commands here:
-          # - ECS: aws ecs update-service --cluster pre-prod-cluster --service frontend-service --force-new-deployment
-          # - EC2: ssh to instance and docker pull + restart
-          # - Docker Compose: docker-compose pull && docker-compose up -d
-
       - name: Deployment Summary
         run: |
-          echo "✅ PRE-PROD Deployment Complete"
-          echo "Environment: PRE-PROD"
-          echo "Branch: ${{ github.ref_name }}"
-          echo "Commit: ${{ github.sha }}"
+          echo "✅ PRE-PROD Docker Images Pushed to ECR"
+          echo "Environment: PRE-PROD (Testing)"
           echo "Image Tag: $IMAGE_TAG"
 
-      - name: Auto-merge to PROD
-        if: github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  auto-merge-to-prod:
+    name: Auto-merge to PROD
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git fetch origin main
-          git checkout main
-          git merge origin/pre-prod --no-ff -m "🚀 Auto-promote PRE-PROD to PROD - ${{ github.sha }}"
-          git push origin main
-
-          echo "✅ Auto-merged PRE-PROD to PROD (main) branch"
-
-      - name: Auto-merge to PROD
-        if: github.event_name == 'push'
+      - name: Merge to PROD
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # Fetch latest
-          git fetch origin main
-
-          # Checkout main
-          git checkout main
-
-          # Merge pre-prod into main
+          git fetch origin prod
+          git checkout prod
           git merge origin/pre-prod --no-ff -m "🚀 Auto-promote PRE-PROD to PROD - ${{ github.sha }}"
+          git push origin prod
 
-          # Push to main
-          git push origin main
-
-          echo "✅ Auto-merged PRE-PROD to PROD (main) branch"
+          echo "✅ Auto-merged PRE-PROD to PROD branch"

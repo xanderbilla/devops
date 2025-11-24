@@ -6,6 +6,9 @@ on:
       - qa
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_REPOSITORY_FE: ${{ secrets.ECR_REPOSITORY_FE }}
@@ -119,6 +122,21 @@ jobs:
           echo "Branch: ${{ github.ref_name }}"
           echo "Commit: ${{ github.sha }}"
           echo "Image Tag: $IMAGE_TAG"
+
+      - name: Auto-merge to PRE-PROD
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin pre-prod
+          git checkout pre-prod
+          git merge origin/qa --no-ff -m "🚀 Auto-promote QA to PRE-PROD - ${{ github.sha }}"
+          git push origin pre-prod
+
+          echo "✅ Auto-merged QA to PRE-PROD branch"
 
       - name: Auto-merge to PRE-PROD
         if: github.event_name == 'push'

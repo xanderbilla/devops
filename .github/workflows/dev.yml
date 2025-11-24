@@ -101,5 +101,3 @@ jobs:
           echo "Branch: ${{ github.ref_name }}"
           echo "Commit: ${{ github.sha }}"
           echo "Image Tag: $IMAGE_TAG"
-          echo ""
-          echo "📝 Next Step: Create a PR from dev → qa for manual approval"

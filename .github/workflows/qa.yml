@@ -26,12 +26,21 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Merge to PRE-PROD
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/xanderbilla/devops.git
           git fetch origin pre-prod
           git checkout pre-prod
           git merge origin/qa --no-ff -m "🚀 Auto-promote QA to PRE-PROD - ${{ github.sha }}"
           git push origin pre-prod
 
           echo "✅ Auto-merged QA to PRE-PROD branch"
+
+      - name: Trigger PRE-PROD Workflow
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
+            https://api.github.com/repos/xanderbilla/devops/actions/workflows/pre-prod.yml/dispatches \
+            -d '{"ref":"pre-prod"}'
+
+          echo "✅ Triggered PRE-PROD workflow"

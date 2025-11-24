@@ -103,9 +103,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Merge to PROD
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/xanderbilla/devops.git
           git fetch origin prod
           git checkout prod
           git merge origin/pre-prod --no-ff -m "🚀 Auto-promote PRE-PROD to PROD - ${{ github.sha }}"

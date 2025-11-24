@@ -97,3 +97,35 @@ jobs:
           echo "Branch: ${{ github.ref_name }}"
           echo "Commit: ${{ github.sha }}"
           echo "Image Tag: $IMAGE_TAG"
+
+      - name: Create PR to QA
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if PR already exists
+          EXISTING_PR=$(gh pr list --base qa --head dev --json number --jq '.[0].number')
+
+          if [ -z "$EXISTING_PR" ]; then
+            gh pr create \
+              --base qa \
+              --head dev \
+              --title "🚀 Promote DEV to QA - ${{ github.sha }}" \
+              --body "**Automated promotion from DEV to QA**
+              
+              - Commit: ${{ github.sha }}
+              - Author: ${{ github.actor }}
+              - Image Tag: $IMAGE_TAG
+              
+              ✅ DEV deployment successful
+              
+              **Next Steps:**
+              1. Review changes
+              2. Approve and merge this PR
+              3. QA deployment will trigger automatically
+              4. After QA success, auto-promotes to PRE-PROD
+              5. After PRE-PROD success, auto-promotes to PROD"
+            echo "✅ Created PR to QA branch"
+          else
+            echo "ℹ️ PR #$EXISTING_PR already exists for dev → qa"
+          fi

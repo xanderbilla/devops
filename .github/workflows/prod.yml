@@ -130,9 +130,6 @@ jobs:
     name: Deploy to PRODUCTION
     runs-on: ubuntu-latest
     needs: terraform
-    environment:
-      name: production
-      url: https://yourdomain.com
 
     steps:
       - name: Checkout code

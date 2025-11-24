@@ -1,0 +1,251 @@
+name: Testing Environment - Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - create-infra
+          - deploy-app
+          - destroy-infra
+      confirm:
+        description: 'Type CONFIRM to proceed'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: '1.6.0'
+  NODE_VERSION: '20'
+  JAVA_VERSION: '17'
+
+jobs:
+  create-infrastructure:
+    name: Create Testing Infrastructure
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'create-infra' && github.event.inputs.confirm == 'CONFIRM'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ./infra-testing
+        run: terraform init
+
+      - name: Remove Old Route (if exists)
+        continue-on-error: true
+        run: |
+          ROUTE_TABLE_ID=$(aws ec2 describe-route-tables \
+            --filters "Name=tag:Name,Values=ankit-testing-private-rt" \
+            --query 'RouteTables[0].RouteTableId' \
+            --output text)
+          
+          if [ -n "$ROUTE_TABLE_ID" ] && [ "$ROUTE_TABLE_ID" != "None" ]; then
+            aws ec2 delete-route \
+              --route-table-id $ROUTE_TABLE_ID \
+              --destination-cidr-block 0.0.0.0/0 || echo "Route already deleted"
+          fi
+
+      - name: Import Existing Resources (if any)
+        working-directory: ./infra-testing
+        continue-on-error: true
+        run: |
+          # Try to import S3 bucket if it exists
+          terraform import -var="db_password=${{ secrets.DB_PASSWORD_TESTING }}" \
+            -var="db_username=${{ secrets.DB_USERNAME_TESTING }}" \
+            -var="frontend_bucket_name=${{ secrets.S3_BUCKET_NAME_TESTING }}" \
+            aws_s3_bucket.frontend ${{ secrets.S3_BUCKET_NAME_TESTING }} 2>/dev/null || echo "Bucket not in state or doesn't exist"
+
+      - name: Terraform Plan
+        working-directory: ./infra-testing
+        run: |
+          terraform plan \
+            -var="db_password=${{ secrets.DB_PASSWORD_TESTING }}" \
+            -var="db_username=${{ secrets.DB_USERNAME_TESTING }}" \
+            -var="frontend_bucket_name=${{ secrets.S3_BUCKET_NAME_TESTING }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ./infra-testing
+        run: terraform apply -auto-approve tfplan
+
+      - name: Export Outputs
+        working-directory: ./infra-testing
+        run: |
+          echo "### ✅ Testing Infrastructure Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ECS Cluster | $(terraform output -raw ecs_cluster_name) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Database | $(terraform output -raw db_address) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend URL | https://$(terraform output -raw cloudfront_domain) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend URL | https://$(terraform output -raw backend_cloudfront_domain) |" >> $GITHUB_STEP_SUMMARY
+
+  deploy-application:
+    name: Deploy Application to Testing
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'deploy-app' && github.event.inputs.confirm == 'CONFIRM'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'maven'
+
+      - name: Build Backend
+        working-directory: ./Backend
+        run: |
+          chmod +x ./mvnw
+          ./mvnw clean package -DskipTests
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Backend Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: testing-${{ github.sha }}
+        working-directory: ./Backend
+        run: |
+          docker build -t $ECR_REGISTRY/springboot-backend:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/springboot-backend:$IMAGE_TAG $ECR_REGISTRY/springboot-backend:testing-latest
+          docker push $ECR_REGISTRY/springboot-backend:$IMAGE_TAG
+          docker push $ECR_REGISTRY/springboot-backend:testing-latest
+
+      - name: Update ECS Service
+        run: |
+          aws ecs update-service \
+            --cluster ankit-testing-cluster \
+            --service ankit-testing-backend-service \
+            --force-new-deployment
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Get Backend URL from Terraform
+        id: backend-url
+        working-directory: ./infra-testing
+        run: |
+          terraform init
+          BACKEND_URL=$(terraform output -raw backend_cloudfront_url 2>/dev/null || echo "")
+          if [ -z "$BACKEND_URL" ]; then
+            echo "⚠️ Could not get backend URL from Terraform, using secret"
+            echo "url=${{ secrets.VITE_API_BASE_URL_TESTING }}" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Backend URL: $BACKEND_URL"
+            echo "url=$BACKEND_URL" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build Frontend
+        working-directory: ./frontend
+        env:
+          VITE_API_BASE_URL: ${{ steps.backend-url.outputs.url }}
+        run: |
+          echo "Building frontend with API URL: $VITE_API_BASE_URL"
+          npm ci
+          npm run build
+
+      - name: Deploy Frontend to S3
+        run: |
+          aws s3 sync ./frontend/dist s3://${{ secrets.S3_BUCKET_NAME_TESTING }} --delete
+
+      - name: Invalidate CloudFront
+        run: |
+          CF_ID=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Origins.Items[?contains(DomainName, '${{ secrets.S3_BUCKET_NAME_TESTING }}')]].Id | [0]" \
+            --output text)
+          
+          if [ -n "$CF_ID" ] && [ "$CF_ID" != "None" ]; then
+            aws cloudfront create-invalidation --distribution-id $CF_ID --paths "/*"
+          fi
+
+      - name: Deployment Summary
+        run: |
+          echo "### ✅ Application Deployed to Testing" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Backend**: Updated ECS service with new image" >> $GITHUB_STEP_SUMMARY
+          echo "**Frontend**: Deployed to S3 and invalidated CloudFront" >> $GITHUB_STEP_SUMMARY
+          echo "**API URL**: ${{ steps.backend-url.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+
+  destroy-infrastructure:
+    name: Destroy Testing Infrastructure
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'destroy-infra' && github.event.inputs.confirm == 'CONFIRM'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ./infra-testing
+        run: terraform init
+
+      - name: Empty S3 Bucket
+        continue-on-error: true
+        run: |
+          aws s3 rm s3://${{ secrets.S3_BUCKET_NAME_TESTING }} --recursive || echo "Bucket already empty"
+
+      - name: Terraform Destroy
+        working-directory: ./infra-testing
+        run: |
+          terraform destroy -auto-approve \
+            -var="db_password=${{ secrets.DB_PASSWORD_TESTING }}" \
+            -var="db_username=${{ secrets.DB_USERNAME_TESTING }}" \
+            -var="frontend_bucket_name=${{ secrets.S3_BUCKET_NAME_TESTING }}"
+
+      - name: Destruction Summary
+        run: |
+          echo "### ✅ Testing Infrastructure Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All testing resources have been removed." >> $GITHUB_STEP_SUMMARY

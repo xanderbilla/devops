@@ -1,0 +1,226 @@
+name: Production Environment - Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - create-infra
+          - deploy-app
+          - destroy-infra
+      confirm:
+        description: 'Type CONFIRM to proceed (for destroy type: DESTROY-PROD)'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: '1.6.0'
+  NODE_VERSION: '20'
+  JAVA_VERSION: '17'
+
+jobs:
+  create-infrastructure:
+    name: Create Production Infrastructure
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'create-infra' && github.event.inputs.confirm == 'CONFIRM'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ./infra
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: ./infra
+        run: |
+          terraform plan \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="db_username=${{ secrets.DB_USERNAME }}" \
+            -var="frontend_bucket_name=${{ secrets.S3_BUCKET_NAME }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ./infra
+        run: terraform apply -auto-approve tfplan
+
+      - name: Export Outputs
+        working-directory: ./infra
+        run: |
+          echo "### ✅ Production Infrastructure Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ECS Cluster | $(terraform output -raw ecs_cluster_name) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Database | $(terraform output -raw db_address) |" >> $GITHUB_STEP_SUMMARY
+          echo "| ALB DNS | $(terraform output -raw alb_dns_name) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend URL | https://$(terraform output -raw cloudfront_domain) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend URL | https://$(terraform output -raw backend_cloudfront_domain) |" >> $GITHUB_STEP_SUMMARY
+
+  deploy-application:
+    name: Deploy Application to Production
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.event.inputs.action == 'deploy-app' && github.event.inputs.confirm == 'CONFIRM'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'maven'
+
+      - name: Build Backend
+        working-directory: ./Backend
+        run: |
+          chmod +x ./mvnw
+          ./mvnw clean package -DskipTests
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Backend Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: prod-${{ github.sha }}
+        working-directory: ./Backend
+        run: |
+          docker build -t $ECR_REGISTRY/springboot-backend:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/springboot-backend:$IMAGE_TAG $ECR_REGISTRY/springboot-backend:latest
+          docker push $ECR_REGISTRY/springboot-backend:$IMAGE_TAG
+          docker push $ECR_REGISTRY/springboot-backend:latest
+
+      - name: Update ECS Service
+        run: |
+          aws ecs update-service \
+            --cluster ankit-demo-cluster \
+            --service ankit-demo-backend-service \
+            --force-new-deployment
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build Frontend
+        working-directory: ./frontend
+        env:
+          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Deploy Frontend to S3
+        run: |
+          aws s3 sync ./frontend/dist s3://${{ secrets.S3_BUCKET_NAME }} \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "index.html" \
+            --exclude "*.html"
+          
+          aws s3 sync ./frontend/dist s3://${{ secrets.S3_BUCKET_NAME }} \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --exclude "*" \
+            --include "*.html"
+
+      - name: Invalidate CloudFront
+        run: |
+          CF_ID=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Origins.Items[?contains(DomainName, '${{ secrets.S3_BUCKET_NAME }}')]].Id | [0]" \
+            --output text)
+          
+          if [ -n "$CF_ID" ] && [ "$CF_ID" != "None" ]; then
+            aws cloudfront create-invalidation --distribution-id $CF_ID --paths "/*"
+          fi
+
+      - name: Deployment Summary
+        run: |
+          echo "### ✅ Application Deployed to Production" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Backend**: Updated ECS service with new image" >> $GITHUB_STEP_SUMMARY
+          echo "**Frontend**: Deployed to S3 and invalidated CloudFront" >> $GITHUB_STEP_SUMMARY
+
+  destroy-infrastructure:
+    name: Destroy Production Infrastructure
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.event.inputs.action == 'destroy-infra' && github.event.inputs.confirm == 'DESTROY-PROD'
+    
+    steps:
+      - name: Validate Destruction Confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DESTROY-PROD" ]; then
+            echo "❌ Invalid confirmation! You must type 'DESTROY-PROD' to destroy production infrastructure."
+            exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ./infra
+        run: terraform init
+
+      - name: Empty S3 Bucket
+        continue-on-error: true
+        run: |
+          aws s3 rm s3://${{ secrets.S3_BUCKET_NAME }} --recursive || echo "Bucket already empty"
+
+      - name: Terraform Destroy
+        working-directory: ./infra
+        run: |
+          terraform destroy -auto-approve \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="db_username=${{ secrets.DB_USERNAME }}" \
+            -var="frontend_bucket_name=${{ secrets.S3_BUCKET_NAME }}"
+
+      - name: Destruction Summary
+        run: |
+          echo "### ⚠️ Production Infrastructure Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All production resources have been removed." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**WARNING**: This action cannot be undone!" >> $GITHUB_STEP_SUMMARY

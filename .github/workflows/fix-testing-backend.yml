@@ -1,0 +1,168 @@
+name: Fix Testing Backend
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Fix to apply'
+        required: true
+        type: choice
+        options:
+          - restart-nat-instance
+          - restart-ecs-service
+          - check-and-fix-all
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  fix-backend:
+    name: Fix Backend Issues
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check Current Status
+        run: |
+          echo "### Current Status" >> $GITHUB_STEP_SUMMARY
+          echo "#### ECS Service" >> $GITHUB_STEP_SUMMARY
+          aws ecs describe-services --cluster ankit-testing-cluster --services ankit-testing-backend-service \
+            --query 'services[0].{Running:runningCount,Desired:desiredCount}' --output table >> $GITHUB_STEP_SUMMARY
+          
+          echo "#### NAT Instance" >> $GITHUB_STEP_SUMMARY
+          aws ec2 describe-instances --filters "Name=tag:Name,Values=ankit-testing-nat-instance" \
+            --query 'Reservations[0].Instances[0].{State:State.Name,SourceDestCheck:SourceDestCheck}' \
+            --output table >> $GITHUB_STEP_SUMMARY
+
+      - name: Fix NAT Instance
+        if: github.event.inputs.action == 'restart-nat-instance' || github.event.inputs.action == 'check-and-fix-all'
+        run: |
+          echo "### Fixing NAT Instance" >> $GITHUB_STEP_SUMMARY
+          
+          # Get NAT instance ID
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=ankit-testing-nat-instance" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          
+          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
+            echo "Found NAT instance: $INSTANCE_ID" >> $GITHUB_STEP_SUMMARY
+            
+            # Ensure source/dest check is disabled
+            aws ec2 modify-instance-attribute --instance-id $INSTANCE_ID --no-source-dest-check
+            echo "✅ Disabled source/dest check" >> $GITHUB_STEP_SUMMARY
+            
+            # Reboot NAT instance to ensure iptables rules are applied
+            aws ec2 reboot-instances --instance-ids $INSTANCE_ID
+            echo "✅ Rebooted NAT instance" >> $GITHUB_STEP_SUMMARY
+            
+            # Wait for instance to be running
+            echo "Waiting for NAT instance to restart..."
+            aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+            echo "✅ NAT instance is running" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ NAT instance not found or not running" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Verify Route Table
+        if: github.event.inputs.action == 'check-and-fix-all'
+        run: |
+          echo "### Verifying Route Table" >> $GITHUB_STEP_SUMMARY
+          
+          # Get NAT instance network interface
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=ankit-testing-nat-instance" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          
+          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
+            ENI_ID=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+              --query 'Reservations[0].Instances[0].NetworkInterfaces[0].NetworkInterfaceId' --output text)
+            
+            # Get route table
+            RT_ID=$(aws ec2 describe-route-tables \
+              --filters "Name=tag:Name,Values=ankit-testing-private-rt" \
+              --query 'RouteTables[0].RouteTableId' --output text)
+            
+            if [ -n "$RT_ID" ] && [ "$RT_ID" != "None" ]; then
+              echo "Route Table: $RT_ID" >> $GITHUB_STEP_SUMMARY
+              echo "NAT ENI: $ENI_ID" >> $GITHUB_STEP_SUMMARY
+              
+              # Check if route exists
+              ROUTE_EXISTS=$(aws ec2 describe-route-tables --route-table-ids $RT_ID \
+                --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0'].NetworkInterfaceId" --output text)
+              
+              if [ "$ROUTE_EXISTS" != "$ENI_ID" ]; then
+                echo "⚠️ Route needs to be fixed" >> $GITHUB_STEP_SUMMARY
+                # Delete old route
+                aws ec2 delete-route --route-table-id $RT_ID --destination-cidr-block 0.0.0.0/0 2>/dev/null || true
+                # Create new route
+                aws ec2 create-route --route-table-id $RT_ID --destination-cidr-block 0.0.0.0/0 --network-interface-id $ENI_ID
+                echo "✅ Route updated" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "✅ Route is correct" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          fi
+
+      - name: Restart ECS Service
+        if: github.event.inputs.action == 'restart-ecs-service' || github.event.inputs.action == 'check-and-fix-all'
+        run: |
+          echo "### Restarting ECS Service" >> $GITHUB_STEP_SUMMARY
+          
+          # Stop all tasks
+          TASK_ARNS=$(aws ecs list-tasks --cluster ankit-testing-cluster --service-name ankit-testing-backend-service --query 'taskArns' --output text)
+          if [ -n "$TASK_ARNS" ]; then
+            for TASK in $TASK_ARNS; do
+              aws ecs stop-task --cluster ankit-testing-cluster --task $TASK --reason "Manual restart via workflow" || true
+            done
+            echo "✅ Stopped existing tasks" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Force new deployment
+          aws ecs update-service \
+            --cluster ankit-testing-cluster \
+            --service ankit-testing-backend-service \
+            --force-new-deployment
+          
+          echo "✅ Triggered new deployment" >> $GITHUB_STEP_SUMMARY
+          
+          # Wait a bit for tasks to start
+          echo "Waiting 30 seconds for tasks to start..."
+          sleep 30
+
+      - name: Check Final Status
+        run: |
+          echo "### Final Status" >> $GITHUB_STEP_SUMMARY
+          
+          echo "#### ECS Service" >> $GITHUB_STEP_SUMMARY
+          aws ecs describe-services --cluster ankit-testing-cluster --services ankit-testing-backend-service \
+            --query 'services[0].{Running:runningCount,Desired:desiredCount,Pending:pendingCount}' \
+            --output table >> $GITHUB_STEP_SUMMARY
+          
+          echo "#### Recent Stopped Tasks" >> $GITHUB_STEP_SUMMARY
+          STOPPED_TASK=$(aws ecs list-tasks --cluster ankit-testing-cluster \
+            --service-name ankit-testing-backend-service --desired-status STOPPED \
+            --max-results 1 --query 'taskArns[0]' --output text)
+          
+          if [ "$STOPPED_TASK" != "None" ] && [ -n "$STOPPED_TASK" ]; then
+            aws ecs describe-tasks --cluster ankit-testing-cluster --tasks $STOPPED_TASK \
+              --query 'tasks[0].{StoppedReason:stoppedReason,Container:containers[0].reason}' \
+              --output table >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "#### Backend Logs (Last 20 lines)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          aws logs tail /ecs/ankit-testing-backend --since 5m --format short 2>/dev/null | tail -20 >> $GITHUB_STEP_SUMMARY || echo "No logs yet" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Summary
+        run: |
+          echo "### 🔧 Fix Applied" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Check the sections above to verify the fix worked." >> $GITHUB_STEP_SUMMARY
+          echo "If tasks are still failing, check the stopped task reason and logs." >> $GITHUB_STEP_SUMMARY
